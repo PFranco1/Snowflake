@@ -1,6 +1,5 @@
 # SnowflakeDatamatcher.py
 
-import os
 import re
 import pandas as pd
 from datasketch import MinHash, MinHashLSH
@@ -9,49 +8,29 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.cluster import MiniBatchKMeans
 from scipy.sparse import hstack
 
-from SnowflakeMgmt.SnowflakeIO import csv_to_hdf5, iter_tables, load_table
+from snowflake.snowpark import Session
+from snowflake.snowpark.functions import col
 
-class DataMatcher:
+class SnowparkDataMatcher:
     def __init__(
         self,
-        target_csv: str,
-        raw_csvs: list[str],
-        h5_store: str = 'data_store.h5',
-        encoding: str = 'utf-8',
-        errors: str = 'replace',
+        session: Session,
+        golden_table: str,
+        raw_tables: list[str],
         debug: bool = False,
-        header_threshold: float = 0.5,    # lowered for more permissive fuzzy
+        header_threshold: float = 0.6,
         data_threshold: float = 0.2,
         hdr_perm: int = 64,
         data_perm: int = 128
     ):
-        self.target_csv       = target_csv
-        self.raw_csvs         = raw_csvs
-        self.h5_store         = h5_store
-        self.encoding         = encoding
-        self.errors           = errors
-        self.debug            = debug
-        self.header_threshold = header_threshold
-        self.data_threshold   = data_threshold
-        self.hdr_perm         = hdr_perm
-        self.data_perm        = data_perm
-
-    def ingest(self):
-        if os.path.exists(self.h5_store):
-            os.remove(self.h5_store)
-        csv_to_hdf5(self.target_csv, self.h5_store,
-                    key='golden', encoding=self.encoding, errors=self.errors)
-        for path in self.raw_csvs:
-            clean = re.sub(r'[^0-9A-Za-z_]', '',
-                           os.path.splitext(os.path.basename(path))[0]
-                           .replace(' ', '_'))
-            key = f"data_{clean}"
-            csv_to_hdf5(path, self.h5_store, key=key,
-                        encoding=self.encoding, errors=self.errors)
-
-    def verify_store(self):
-        with pd.HDFStore(self.h5_store, 'r') as store:
-            print("HDF5 keys:", store.keys())
+        self.session         = session
+        self.golden_table    = golden_table
+        self.raw_tables      = raw_tables
+        self.debug           = debug
+        self.header_threshold= header_threshold
+        self.data_threshold  = data_threshold
+        self.hdr_perm        = hdr_perm
+        self.data_perm       = data_perm
 
     @staticmethod
     def normalize_header(name: str) -> str:
@@ -74,7 +53,7 @@ class DataMatcher:
             return 0.0
         return len(u1 & u2) / len(u1 | u2)
 
-    def fuzzy_header_lsh(self, raw_cols: list[str]) -> MinHashLSH:
+    def _fuzzy_header_lsh(self, raw_cols: list[str]) -> MinHashLSH:
         lsh = MinHashLSH(threshold=self.header_threshold,
                          num_perm=self.hdr_perm)
         for c in raw_cols:
@@ -84,100 +63,56 @@ class DataMatcher:
             lsh.insert(c, m)
         return lsh
 
-    def cluster(
-        self,
-        n_clusters: int = 9,
-        batch_size: int = 4096,
-        text_features: int = 5000
-    ) -> pd.DataFrame:
-        """Cluster the golden table rows and return it with a 'cluster' column."""
-        df = load_table(self.h5_store, 'golden')
-        num_cols = df.select_dtypes(include='number').columns.tolist()
-        txt_cols = df.select_dtypes(include='object').columns.tolist()
-
-        Xn = None
-        if num_cols:
-            Xn = StandardScaler().fit_transform(df[num_cols].fillna(0))
-
-        Xt = None
-        if txt_cols:
-            combined = df[txt_cols].fillna('').agg(' '.join, axis=1)
-            Xt = TfidfVectorizer(max_features=text_features).fit_transform(combined)
-
-        # explicit combination logic
-        if Xn is not None and Xt is not None:
-            X = hstack([Xn, Xt])
-        elif Xn is not None:
-            X = Xn
-        elif Xt is not None:
-            X = Xt
-        else:
-            raise RuntimeError("No numeric or text features to cluster on")
-
-        km = MiniBatchKMeans(
-            n_clusters=n_clusters,
-            batch_size=batch_size,
-            random_state=42,
-            n_init=10
-        )
-        labels = km.fit_predict(X)
-
-        out = df.copy()
-        out['cluster'] = labels
-        return out
-
+    def _load_table(self, tbl: str) -> pd.DataFrame:
+        """Read a Snowflake table into pandas via Snowpark."""
+        # assume header row in table; adjust if needed
+        return self.session.table(tbl).to_pandas()
 
     def match(self) -> pd.DataFrame:
-        # rebuild store if missing
-        if not os.path.exists(self.h5_store):
-            self.ingest()
-
-        # load golden
-        with pd.HDFStore(self.h5_store, 'r') as store:
-            golden = store['golden']
+        """Perform fuzzy & exact header/data matching on live Snowflake tables."""
+        # 1) load golden
+        golden = self._load_table(self.golden_table)
         gold_cols = list(golden.columns)
 
         summary = []
-        # iterate raw tables
-        for tbl in iter_tables(self.h5_store, prefix='/'):
-            name = tbl.strip('/')
-            if not name.startswith('data_'):
-                continue
-            with pd.HDFStore(self.h5_store, 'r') as store:
-                raw = store[tbl]
+        for tbl in self.raw_tables:
+            raw = self._load_table(tbl)
             raw_cols = list(raw.columns)
+            if self.debug:
+                print(f"\n--- Matching against {tbl} ---")
+                print(" Raw cols:", raw_cols)
 
-            # build LSH index for raw headers
-            hdr_lsh = self.fuzzy_header_lsh(raw_cols)
+            # build header‐LSH
+            hdr_lsh = self._fuzzy_header_lsh(raw_cols)
 
             for gcol in gold_cols:
+                # exact header
                 hdr_exact = [c for c in raw_cols if c == gcol]
 
-                # 1) fuzzy-header via LSH
+                # fuzzy header
                 hdr_fuzzy = []
                 if not hdr_exact:
+                    # 1) LSH
                     m = MinHash(num_perm=self.hdr_perm)
-                    for token in re.findall(r"\w+", gcol.lower()):
-                        m.update(token.encode('utf8'))
+                    for tok in re.findall(r"\w+", gcol.lower()):
+                        m.update(tok.encode('utf8'))
                     hdr_fuzzy = hdr_lsh.query(m)
+                    # 2) substring fallback
+                    if not hdr_fuzzy:
+                        ng = self.normalize_header(gcol)
+                        hdr_fuzzy = [
+                            c for c in raw_cols
+                            if ng in self.normalize_header(c)
+                            or self.normalize_header(c) in ng
+                        ]
+                    # 3) token‐Jaccard fallback
+                    if not hdr_fuzzy:
+                        for c in raw_cols:
+                            j = self.token_jaccard(gcol, c)
+                            if j >= self.header_threshold:
+                                hdr_fuzzy.append(c)
 
-                # 2) fallback substring
-                if not hdr_exact and not hdr_fuzzy:
-                    ng = self.normalize_header(gcol)
-                    hdr_fuzzy = [
-                        c for c in raw_cols
-                        if ng in self.normalize_header(c)
-                        or self.normalize_header(c) in ng
-                    ]
-
-                # 3) fallback token‐Jaccard
-                if not hdr_exact and not hdr_fuzzy:
-                    for c in raw_cols:
-                        j = self.token_jaccard(gcol, c)
-                        if j >= self.header_threshold:
-                            hdr_fuzzy.append(c)
-
-                # exact-data
+                # exact data
                 data_exact = []
                 for rc in raw_cols:
                     a = golden[gcol].fillna('').astype(str).reset_index(drop=True)
@@ -185,7 +120,7 @@ class DataMatcher:
                     if a.equals(b):
                         data_exact.append(rc)
 
-                # fuzzy-data
+                # fuzzy data
                 data_fuzzy = []
                 if not data_exact:
                     for rc in raw_cols:
@@ -193,9 +128,10 @@ class DataMatcher:
                         if j >= self.data_threshold:
                             data_fuzzy.append((rc, round(j,2)))
 
+                # record only if any match
                 if hdr_exact or hdr_fuzzy or data_exact or data_fuzzy:
                     summary.append({
-                        'raw_table': name,
+                        'raw_table': tbl,
                         'golden_col': gcol,
                         'hdr_exact': hdr_exact,
                         'hdr_fuzzy': hdr_fuzzy,
@@ -205,13 +141,57 @@ class DataMatcher:
 
         return pd.DataFrame(summary)
 
+    def cluster(self,
+                n_clusters: int = 5,
+                text_features: int = 5000
+               ) -> pd.DataFrame:
+        """Cluster the golden table rows and attach 'cluster' column."""
+        df = self._load_table(self.golden_table)
+        num_cols = df.select_dtypes(include='number').columns.tolist()
+        txt_cols = df.select_dtypes(include='object').columns.tolist()
+
+        Xn = (StandardScaler().fit_transform(df[num_cols].fillna(0))
+              if num_cols else None)
+        Xt = None
+        if txt_cols:
+            combined = df[txt_cols].fillna('').agg(' '.join, axis=1)
+            Xt = TfidfVectorizer(max_features=text_features).fit_transform(combined)
+
+        if Xn is not None and Xt is not None:
+            X = hstack([Xn, Xt])
+        elif Xn is not None:
+            X = Xn
+        else:
+            X = Xt
+
+        km = MiniBatchKMeans(n_clusters=n_clusters,
+                             batch_size=4096,
+                             random_state=42, n_init=10)
+        labels = km.fit_predict(X)
+        out = df.copy()
+        out['cluster'] = labels
+        return out
+
     def run(self) -> tuple[pd.DataFrame, pd.DataFrame]:
-        self.ingest()
-        self.verify_store()
+        """Full pipeline: match + cluster on live tables."""
         summary_df  = self.match()
         clusters_df = self.cluster()
         return summary_df, clusters_df
 
-def match_files(target: str, raws: list[str], debug: bool = False):
-    dm = DataMatcher(target, raws, debug=debug)
-    return dm.run()
+  
+# in your worksheet you would do:
+#
+# from SnowflakeDatamatcher import SnowparkDataMatcher
+# matcher = SnowparkDataMatcher(
+#     session,
+#     golden_table="MY_DB.MY_SCHEMA.DIAMOND_CLIENTS_LIST",
+#     raw_tables=[
+#         "MY_DB.MY_SCHEMA.TEST1",
+#         "MY_DB.MY_SCHEMA.LST_ASSUMPTION_DASHBOARD",
+#         "MY_DB.MY_SCHEMA.PRODUCT_HIERARCHY_EXTERNAL"
+#     ],
+#     debug=False
+# )
+# summary_df, clusters_df = matcher.run()
+# display(summary_df)
+# display(clusters_df)
